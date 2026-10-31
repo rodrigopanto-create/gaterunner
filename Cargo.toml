@@ -1,0 +1,8 @@
+[package]
+name = "gaterunner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Macroquad: motor 2D simple para juegos en Rust
+macroquad = "0.4"
