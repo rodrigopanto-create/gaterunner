@@ -1,11 +1,12 @@
 // ============================================================
-// GATE RUNNER - Paso 5: dificultad progresiva + struct Game
+// GATE RUNNER - Paso 7: estados del juego y puntaje maximo
 // ============================================================
 // Objetivo de este paso:
-//   1. Ordenar todo el estado del juego dentro de un "struct Game".
-//   2. Dividir la logica en funciones pequenas (metodos).
-//   3. Calcular un NIVEL segun el puntaje.
-//   4. A mayor nivel: enemigos con mas vida, mas rapidos y mas frecuentes.
+//   1. Un enum "State" para saber en que pantalla estamos:
+//      Menu, Playing (jugando), Paused (pausa) o GameOver.
+//   2. Pausar con P (o ESC) y volver con la misma tecla.
+//   3. Guardar el record en un archivo (highscore.txt) para que
+//      se conserve aunque cierres el juego.
 // ============================================================
 
 // "prelude" importa todo lo comun de macroquad (colores, teclas, dibujo...)
@@ -31,7 +32,7 @@ const ENEMY_BASE_HP: i32 = 3; // vida inicial
 const ENEMY_BASE_SPEED: f32 = 80.0; // velocidad inicial (pixeles por segundo)
 const BASE_SPAWN_INTERVAL: f32 = 1.0; // segundos entre enemigos al inicio
 
-// Limites de la dificultad (para que el juego no se vuelva imposible)
+// Limites de la dificultad
 const ENEMY_MAX_SPEED: f32 = 220.0;
 const MIN_SPAWN_INTERVAL: f32 = 0.35;
 
@@ -47,6 +48,45 @@ const GATE_INTERVAL: f32 = 5.0; // segundos entre filas de puertas
 const START_LIVES: i32 = 5;
 const START_SOLDIERS: i32 = 1;
 const MAX_SOLDIERS: i32 = 999;
+
+// Efectos visuales
+const GRID_SIZE: f32 = 80.0; // distancia entre las lineas horizontales del fondo
+const BG_SPEED: f32 = 60.0; // velocidad a la que bajan las lineas del fondo
+const PARTICLES_PER_EXPLOSION: i32 = 12; // particulas al destruir un enemigo
+const PARTICLE_LIFE: f32 = 0.5; // segundos que dura una particula
+const BANNER_TIME: f32 = 2.0; // segundos que se ve el aviso de nivel
+
+// Archivo donde se guarda el record (en la carpeta desde donde ejecutas el juego)
+const HIGH_SCORE_FILE: &str = "highscore.txt";
+
+// ---------- RECORD: leer y guardar en archivo ----------
+// Lee el record guardado. Si el archivo no existe o esta danado, devuelve 0.
+fn load_high_score() -> i32 {
+    // read_to_string devuelve un "Result" (puede fallar). Con .ok() lo
+    // convertimos en Option, con and_then/parse intentamos convertir el
+    // texto a numero, y con unwrap_or(0) usamos 0 si algo fallo.
+    std::fs::read_to_string(HIGH_SCORE_FILE)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+// Guarda el record como texto en el archivo.
+fn save_high_score(score: i32) {
+    // "let _ =" ignora el resultado: si no se puede guardar, el juego sigue.
+    let _ = std::fs::write(HIGH_SCORE_FILE, score.to_string());
+}
+
+// ---------- ENUM: estado del juego ----------
+// El juego siempre esta en UNO de estos estados.
+// PartialEq permite comparar con ==, Clone/Copy permiten copiarlo facil.
+#[derive(Clone, Copy, PartialEq)]
+enum State {
+    Menu,     // pantalla de inicio
+    Playing,  // jugando
+    Paused,   // en pausa
+    GameOver, // perdimos
+}
 
 // ---------- ENUM: tipos de puerta ----------
 #[derive(Clone, Copy)]
@@ -104,8 +144,8 @@ struct Bullet {
 struct Enemy {
     x: f32, // centro del enemigo
     y: f32,
-    hp: i32,     // vida restante
-    speed: f32,  // cada enemigo recuerda la velocidad con la que nacio
+    hp: i32,    // vida restante
+    speed: f32, // cada enemigo recuerda la velocidad con la que nacio
 }
 
 // Una fila de dos puertas (izquierda y derecha).
@@ -116,43 +156,95 @@ struct GatePair {
     used: bool,
 }
 
+// Una particula: un puntito que sale volando y se desvanece.
+struct Particle {
+    x: f32,
+    y: f32,
+    vx: f32,   // velocidad horizontal
+    vy: f32,   // velocidad vertical
+    life: f32, // segundos que le quedan; al llegar a 0 desaparece
+}
+
+// ---------- FUNCIONES AUXILIARES ----------
 // Altura (Y) de la torreta. La usamos en varios lugares.
 fn player_y() -> f32 {
     screen_height() - PLAYER_BOTTOM_MARGIN
 }
 
+// Dibuja un texto centrado horizontalmente en la pantalla.
+// Asi no repetimos el calculo con measure_text cada vez.
+fn draw_centered(text: &str, y: f32, size: u16, color: Color) {
+    let dims = measure_text(text, None, size, 1.0);
+    draw_text(
+        text,
+        screen_width() / 2.0 - dims.width / 2.0,
+        y,
+        size as f32,
+        color,
+    );
+}
+
 // ---------- STRUCT GAME: todo el estado de la partida ----------
-// Guardar todo junto nos permite reiniciar con una sola linea
-// y dividir la logica en metodos pequenos.
 struct Game {
+    state: State,      // NUEVO: en que pantalla estamos
+    high_score: i32,   // NUEVO: mejor puntaje guardado
+    new_record: bool,  // NUEVO: true si en esta partida superamos el record
     player_x: f32,
     bullets: Vec<Bullet>,
     enemies: Vec<Enemy>,
     gates: Vec<GatePair>,
+    particles: Vec<Particle>,
     fire_timer: f32,
     spawn_timer: f32,
     gate_timer: f32,
     score: i32,
     lives: i32,
     soldiers: i32,
-    game_over: bool,
+    bg_scroll: f32,    // cuanto se ha desplazado el fondo
+    last_level: i32,   // ultimo nivel visto (para detectar cuando sube)
+    banner_timer: f32, // tiempo restante del aviso "NIVEL N"
 }
 
 impl Game {
-    // Crea una partida nueva con los valores iniciales.
-    fn new() -> Game {
+    // Crea el juego en el menu. Recibe el record para no perderlo al reiniciar.
+    fn new(high_score: i32) -> Game {
         Game {
+            state: State::Menu,
+            high_score,
+            new_record: false,
             player_x: screen_width() / 2.0,
             bullets: Vec::new(),
             enemies: Vec::new(),
             gates: Vec::new(),
+            particles: Vec::new(),
             fire_timer: 0.0,
             spawn_timer: 0.0,
             gate_timer: 2.0, // la primera fila de puertas sale a los 2 s
             score: 0,
             lives: START_LIVES,
             soldiers: START_SOLDIERS,
-            game_over: false,
+            bg_scroll: 0.0,
+            last_level: 1,
+            banner_timer: 0.0,
+        }
+    }
+
+    // Empieza una partida nueva conservando el record.
+    fn start_run(&mut self) {
+        // Primero se calcula Game::new(...) y despues se reemplaza todo el estado.
+        *self = Game::new(self.high_score);
+        self.state = State::Playing;
+    }
+
+    // Se llama cuando las vidas llegan a 0.
+    fn end_game(&mut self) {
+        self.state = State::GameOver;
+
+        // ¿Superamos el record? Lo actualizamos y lo guardamos en el archivo.
+        if self.score > self.high_score {
+            self.high_score = self.score;
+            self.new_record = true;
+            save_high_score(self.score);
         }
     }
 
@@ -178,22 +270,90 @@ impl Game {
     }
 
     // ---------- ACTUALIZAR ----------
-    // Se llama una vez por frame. Cada paso vive en su propio metodo.
+    // Segun el estado actual, hacemos cosas distintas.
     fn update(&mut self, dt: f32) {
-        // En game over solo esperamos la tecla R para reiniciar.
-        if self.game_over {
-            if is_key_pressed(KeyCode::R) {
-                // Reemplazamos todo el estado por una partida nueva.
-                *self = Game::new();
+        // "match" revisa en que estado estamos y ejecuta solo esa rama.
+        match self.state {
+            State::Menu => {
+                self.update_effects(dt); // el fondo sigue moviendose
+                // ENTER empieza la partida (no usamos ESPACIO porque es el disparo).
+                if is_key_pressed(KeyCode::Enter) {
+                    self.start_run();
+                }
             }
-            return; // salimos: no se actualiza nada mas
-        }
 
-        self.handle_input(dt);
-        self.spawn_things(dt);
-        self.move_things(dt);
-        self.check_collisions();
-        self.cleanup();
+            State::Playing => {
+                self.update_effects(dt);
+
+                // P o ESC pausan el juego. "return" sale de update:
+                // en ese frame ya no se mueve nada.
+                if is_key_pressed(KeyCode::P) || is_key_pressed(KeyCode::Escape) {
+                    self.state = State::Paused;
+                    return;
+                }
+
+                self.handle_input(dt);
+                self.spawn_things(dt);
+                self.move_things(dt);
+                self.check_collisions();
+                self.cleanup();
+            }
+
+            State::Paused => {
+                // En pausa NO llamamos a update_effects ni a nada mas:
+                // todo queda congelado. Solo esperamos para reanudar.
+                if is_key_pressed(KeyCode::P) || is_key_pressed(KeyCode::Escape) {
+                    self.state = State::Playing;
+                }
+            }
+
+            State::GameOver => {
+                self.update_effects(dt);
+                if is_key_pressed(KeyCode::R) {
+                    self.start_run(); // jugar otra vez
+                }
+                if is_key_pressed(KeyCode::M) {
+                    *self = Game::new(self.high_score); // volver al menu
+                }
+            }
+        }
+    }
+
+    // Fondo, particulas y aviso de nivel.
+    fn update_effects(&mut self, dt: f32) {
+        // Fondo: avanza y vuelve a empezar cada GRID_SIZE pixeles.
+        self.bg_scroll = (self.bg_scroll + BG_SPEED * dt) % GRID_SIZE;
+
+        // Particulas: se mueven, envejecen y las muertas se borran.
+        for p in self.particles.iter_mut() {
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+            p.life -= dt;
+        }
+        self.particles.retain(|p| p.life > 0.0);
+
+        // Aviso de nivel: si el nivel cambio, activamos el aviso.
+        if self.level() != self.last_level {
+            self.last_level = self.level();
+            self.banner_timer = BANNER_TIME;
+        }
+        self.banner_timer = (self.banner_timer - dt).max(0.0);
+    }
+
+    // Crea una explosion de particulas en (x, y).
+    fn spawn_explosion(&mut self, x: f32, y: f32) {
+        for _ in 0..PARTICLES_PER_EXPLOSION {
+            let angle = rand::gen_range(0.0, std::f32::consts::TAU);
+            let speed = rand::gen_range(60.0, 200.0);
+
+            self.particles.push(Particle {
+                x,
+                y,
+                vx: angle.cos() * speed,
+                vy: angle.sin() * speed,
+                life: PARTICLE_LIFE,
+            });
+        }
     }
 
     // Teclado: mover y disparar.
@@ -300,9 +460,19 @@ impl Game {
             }
         }
 
-        // Enemigos destruidos -> +10 puntos cada uno
-        let killed = self.enemies.iter().filter(|e| e.hp <= 0).count() as i32;
-        self.score += killed * 10;
+        // Posiciones de los enemigos destruidos (primero juntamos, luego usamos).
+        let dead_positions: Vec<(f32, f32)> = self
+            .enemies
+            .iter()
+            .filter(|e| e.hp <= 0)
+            .map(|e| (e.x, e.y))
+            .collect();
+
+        // +10 puntos y una explosion por cada enemigo destruido
+        for (x, y) in &dead_positions {
+            self.score += 10;
+            self.spawn_explosion(*x, *y);
+        }
 
         // Enemigos vivos que cruzaron la linea inferior -> pierdes vidas
         let escaped = self
@@ -314,7 +484,7 @@ impl Game {
 
         if self.lives <= 0 {
             self.lives = 0;
-            self.game_over = true;
+            self.end_game(); // cambia el estado a GameOver y revisa el record
         }
     }
 
@@ -330,8 +500,17 @@ impl Game {
     // &self (sin mut): dibujar solo LEE el estado, no lo cambia.
     fn draw(&self) {
         clear_background(Color::from_rgba(20, 24, 40, 255));
+        self.draw_background();
 
-        // Puertas (primero, para que queden detras)
+        // En el menu solo dibujamos la pantalla de inicio y terminamos.
+        if self.state == State::Menu {
+            self.draw_menu();
+            return;
+        }
+
+        // ---- Desde aqui: Playing, Paused y GameOver comparten el dibujo del juego ----
+
+        // Puertas (antes que lo demas, para que queden detras)
         let half = screen_width() / 2.0;
         for pair in &self.gates {
             let sides = [(0.0, pair.left), (half, pair.right)];
@@ -373,6 +552,13 @@ impl Game {
             );
         }
 
+        // Particulas: se hacen mas transparentes y pequenas al envejecer.
+        for p in &self.particles {
+            let fraction = p.life / PARTICLE_LIFE; // 1.0 = recien nacida, 0.0 = por desaparecer
+            let color = Color::new(1.0, 0.6, 0.1, fraction);
+            draw_circle(p.x, p.y, 2.0 + 3.0 * fraction, color);
+        }
+
         // Torreta y su numero de soldados
         draw_rectangle(
             self.player_x - PLAYER_WIDTH / 2.0,
@@ -400,26 +586,130 @@ impl Game {
             26.0,
             SKYBLUE,
         );
+        // El record mostrado sube en vivo si lo estamos superando.
+        let shown_record = self.high_score.max(self.score);
+        draw_text(
+            &format!("Record: {}", shown_record),
+            screen_width() - 160.0,
+            30.0,
+            26.0,
+            GREEN,
+        );
 
-        // Pantalla de game over
-        if self.game_over {
-            let title = "GAME OVER";
-            let size = measure_text(title, None, 60, 1.0);
-            draw_text(
-                title,
-                screen_width() / 2.0 - size.width / 2.0,
-                screen_height() / 2.0,
-                60.0,
-                RED,
+        // Aviso "NIVEL N" (solo mientras banner_timer > 0)
+        if self.banner_timer > 0.0 {
+            let alpha = (self.banner_timer / BANNER_TIME).min(1.0); // se desvanece
+            draw_centered(
+                &format!("NIVEL {}", self.level()),
+                screen_height() * 0.3,
+                70,
+                Color::new(1.0, 0.84, 0.0, alpha),
             );
-            draw_text(
-                "Presiona R para reiniciar",
-                screen_width() / 2.0 - 140.0,
-                screen_height() / 2.0 + 40.0,
-                26.0,
+        }
+
+        // ---- Capas encima del juego segun el estado ----
+        match self.state {
+            State::Paused => {
+                // Rectangulo negro semitransparente que oscurece la pantalla
+                draw_rectangle(
+                    0.0,
+                    0.0,
+                    screen_width(),
+                    screen_height(),
+                    Color::new(0.0, 0.0, 0.0, 0.55),
+                );
+                draw_centered("PAUSA", screen_height() / 2.0, 70, WHITE);
+                draw_centered(
+                    "Presiona P para continuar",
+                    screen_height() / 2.0 + 40.0,
+                    26,
+                    LIGHTGRAY,
+                );
+            }
+            State::GameOver => {
+                draw_centered("GAME OVER", screen_height() / 2.0 - 40.0, 60, RED);
+                draw_centered(
+                    &format!("Puntos: {}", self.score),
+                    screen_height() / 2.0,
+                    30,
+                    WHITE,
+                );
+                // Mensaje de record: uno u otro segun si lo superamos.
+                if self.new_record {
+                    draw_centered("NUEVO RECORD!", screen_height() / 2.0 + 35.0, 36, GREEN);
+                } else {
+                    draw_centered(
+                        &format!("Record: {}", self.high_score),
+                        screen_height() / 2.0 + 35.0,
+                        28,
+                        LIGHTGRAY,
+                    );
+                }
+                draw_centered(
+                    "R: jugar otra vez   M: menu",
+                    screen_height() / 2.0 + 80.0,
+                    26,
+                    WHITE,
+                );
+            }
+            // Playing y Menu no dibujan nada extra aqui.
+            _ => {}
+        }
+    }
+
+    // Pantalla de inicio.
+    fn draw_menu(&self) {
+        draw_centered("GATE RUNNER", screen_height() * 0.28, 70, GOLD);
+        draw_centered(
+            "Cruza las puertas, multiplica",
+            screen_height() * 0.28 + 40.0,
+            26,
+            SKYBLUE,
+        );
+        draw_centered(
+            "tu ejercito y defiende la linea!",
+            screen_height() * 0.28 + 70.0,
+            26,
+            SKYBLUE,
+        );
+
+        // Controles
+        draw_centered("Mover: flechas o A / D", screen_height() * 0.52, 26, WHITE);
+        draw_centered("Disparar: ESPACIO", screen_height() * 0.52 + 32.0, 26, WHITE);
+        draw_centered("Pausa: P o ESC", screen_height() * 0.52 + 64.0, 26, WHITE);
+
+        draw_centered(
+            &format!("Record: {}", self.high_score),
+            screen_height() * 0.52 + 120.0,
+            30,
+            GREEN,
+        );
+
+        // Texto parpadeante: get_time() son los segundos desde que arranco el juego.
+        // Dividimos en "medios segundos" y mostramos el texto solo en los pares.
+        if (get_time() * 2.0) as i32 % 2 == 0 {
+            draw_centered(
+                "Presiona ENTER para jugar",
+                screen_height() * 0.85,
+                30,
                 WHITE,
             );
         }
+    }
+
+    // Dibuja el fondo (lineas horizontales que bajan + linea central).
+    fn draw_background(&self) {
+        let line_color = Color::from_rgba(255, 255, 255, 18); // blanco muy tenue
+
+        let rows = (screen_height() / GRID_SIZE) as i32 + 2;
+        for i in -1..rows {
+            let y = i as f32 * GRID_SIZE + self.bg_scroll;
+            draw_line(0.0, y, screen_width(), y, 1.0, line_color);
+        }
+
+        // Linea central: separa visualmente la puerta izquierda de la derecha.
+        let mid = screen_width() / 2.0;
+        draw_line(mid, 0.0, mid, screen_height(), 2.0, line_color);
     }
 }
 
@@ -434,13 +724,14 @@ fn window_conf() -> Conf {
     }
 }
 
-// Ahora main es muy corto: crea la partida y repite actualizar + dibujar.
+// main sigue siendo muy corto: crea la partida y repite actualizar + dibujar.
 #[macroquad::main(window_conf)]
 async fn main() {
     // Semilla del generador de numeros aleatorios (la hora actual).
     rand::srand(macroquad::miniquad::date::now() as u64);
 
-    let mut game = Game::new();
+    // Cargamos el record guardado y arrancamos en el menu.
+    let mut game = Game::new(load_high_score());
 
     loop {
         let dt = get_frame_time();
