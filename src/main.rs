@@ -1,12 +1,14 @@
 // ============================================================
-// GATE RUNNER - Paso 7: estados del juego y puntaje maximo
+// GATE RUNNER - Paso 8: power-ups y fondo de estrellas
 // ============================================================
 // Objetivo de este paso:
-//   1. Un enum "State" para saber en que pantalla estamos:
-//      Menu, Playing (jugando), Paused (pausa) o GameOver.
-//   2. Pausar con P (o ESC) y volver con la misma tecla.
-//   3. Guardar el record en un archivo (highscore.txt) para que
-//      se conserve aunque cierres el juego.
+//   1. Los enemigos destruidos a veces sueltan un power-up que cae.
+//      Al tocarlo con la torreta se activa:
+//        R = disparo rapido (por unos segundos)
+//        S = escudo (bloquea el siguiente enemigo que se escape)
+//        + = una vida extra
+//   2. Fondo de estrellas con "parallax": las rapidas se ven
+//      grandes y brillantes (cerca), las lentas pequenas (lejos).
 // ============================================================
 
 // "prelude" importa todo lo comun de macroquad (colores, teclas, dibujo...)
@@ -46,12 +48,23 @@ const GATE_INTERVAL: f32 = 5.0; // segundos entre filas de puertas
 
 // Partida
 const START_LIVES: i32 = 5;
+const MAX_LIVES: i32 = 9; // con items de vida no pasamos de aqui
 const START_SOLDIERS: i32 = 1;
 const MAX_SOLDIERS: i32 = 999;
 
+// Power-ups
+const POWERUP_DROP_CHANCE: f32 = 0.2; // 0.2 = 20% de probabilidad al destruir un enemigo
+const POWERUP_SPEED: f32 = 110.0; // velocidad de caida
+const POWERUP_RADIUS: f32 = 14.0; // tamano del circulo
+const RAPID_DURATION: f32 = 6.0; // segundos que dura el disparo rapido
+const RAPID_FIRE_FACTOR: f32 = 0.4; // el cooldown se multiplica por esto (menos = mas rapido)
+
+// Fondo de estrellas
+const STAR_COUNT: i32 = 90; // cuantas estrellas hay
+const STAR_MIN_SPEED: f32 = 20.0; // estrella mas lenta (lejana)
+const STAR_MAX_SPEED: f32 = 150.0; // estrella mas rapida (cercana)
+
 // Efectos visuales
-const GRID_SIZE: f32 = 80.0; // distancia entre las lineas horizontales del fondo
-const BG_SPEED: f32 = 60.0; // velocidad a la que bajan las lineas del fondo
 const PARTICLES_PER_EXPLOSION: i32 = 12; // particulas al destruir un enemigo
 const PARTICLE_LIFE: f32 = 0.5; // segundos que dura una particula
 const BANNER_TIME: f32 = 2.0; // segundos que se ve el aviso de nivel
@@ -62,9 +75,6 @@ const HIGH_SCORE_FILE: &str = "highscore.txt";
 // ---------- RECORD: leer y guardar en archivo ----------
 // Lee el record guardado. Si el archivo no existe o esta danado, devuelve 0.
 fn load_high_score() -> i32 {
-    // read_to_string devuelve un "Result" (puede fallar). Con .ok() lo
-    // convertimos en Option, con and_then/parse intentamos convertir el
-    // texto a numero, y con unwrap_or(0) usamos 0 si algo fallo.
     std::fs::read_to_string(HIGH_SCORE_FILE)
         .ok()
         .and_then(|text| text.trim().parse().ok())
@@ -73,13 +83,10 @@ fn load_high_score() -> i32 {
 
 // Guarda el record como texto en el archivo.
 fn save_high_score(score: i32) {
-    // "let _ =" ignora el resultado: si no se puede guardar, el juego sigue.
     let _ = std::fs::write(HIGH_SCORE_FILE, score.to_string());
 }
 
 // ---------- ENUM: estado del juego ----------
-// El juego siempre esta en UNO de estos estados.
-// PartialEq permite comparar con ==, Clone/Copy permiten copiarlo facil.
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Menu,     // pantalla de inicio
@@ -134,6 +141,34 @@ fn random_gate_op() -> GateOp {
     }
 }
 
+// ---------- ENUM: tipos de power-up ----------
+#[derive(Clone, Copy)]
+enum PowerUpKind {
+    RapidFire, // disparo rapido por unos segundos
+    Shield,    // bloquea el siguiente enemigo que se escape
+    Heart,     // +1 vida
+}
+
+impl PowerUpKind {
+    // Color del circulo.
+    fn color(&self) -> Color {
+        match self {
+            PowerUpKind::RapidFire => ORANGE,
+            PowerUpKind::Shield => SKYBLUE,
+            PowerUpKind::Heart => GREEN,
+        }
+    }
+
+    // Letra que se dibuja dentro del circulo.
+    fn letter(&self) -> &'static str {
+        match self {
+            PowerUpKind::RapidFire => "R",
+            PowerUpKind::Shield => "S",
+            PowerUpKind::Heart => "+",
+        }
+    }
+}
+
 // ---------- STRUCTS: objetos del juego ----------
 struct Bullet {
     x: f32,
@@ -165,6 +200,20 @@ struct Particle {
     life: f32, // segundos que le quedan; al llegar a 0 desaparece
 }
 
+// Un power-up que cae esperando a que lo recojamos.
+struct PowerUp {
+    x: f32,
+    y: f32,
+    kind: PowerUpKind,
+}
+
+// Una estrella del fondo. Su velocidad decide cuan "cerca" parece.
+struct Star {
+    x: f32,
+    y: f32,
+    speed: f32,
+}
+
 // ---------- FUNCIONES AUXILIARES ----------
 // Altura (Y) de la torreta. La usamos en varios lugares.
 fn player_y() -> f32 {
@@ -172,7 +221,6 @@ fn player_y() -> f32 {
 }
 
 // Dibuja un texto centrado horizontalmente en la pantalla.
-// Asi no repetimos el calculo con measure_text cada vez.
 fn draw_centered(text: &str, y: f32, size: u16, color: Color) {
     let dims = measure_text(text, None, size, 1.0);
     draw_text(
@@ -184,23 +232,39 @@ fn draw_centered(text: &str, y: f32, size: u16, color: Color) {
     );
 }
 
+// Crea todas las estrellas del fondo en posiciones y velocidades al azar.
+fn new_stars() -> Vec<Star> {
+    let mut stars = Vec::new();
+    for _ in 0..STAR_COUNT {
+        stars.push(Star {
+            x: rand::gen_range(0.0, screen_width()),
+            y: rand::gen_range(0.0, screen_height()),
+            speed: rand::gen_range(STAR_MIN_SPEED, STAR_MAX_SPEED),
+        });
+    }
+    stars
+}
+
 // ---------- STRUCT GAME: todo el estado de la partida ----------
 struct Game {
-    state: State,      // NUEVO: en que pantalla estamos
-    high_score: i32,   // NUEVO: mejor puntaje guardado
-    new_record: bool,  // NUEVO: true si en esta partida superamos el record
+    state: State,     // en que pantalla estamos
+    high_score: i32,  // mejor puntaje guardado
+    new_record: bool, // true si en esta partida superamos el record
     player_x: f32,
     bullets: Vec<Bullet>,
     enemies: Vec<Enemy>,
     gates: Vec<GatePair>,
     particles: Vec<Particle>,
+    powerups: Vec<PowerUp>, // NUEVO: power-ups cayendo
+    stars: Vec<Star>,       // NUEVO: estrellas del fondo
+    rapid_timer: f32,       // NUEVO: segundos restantes de disparo rapido
+    shield: bool,           // NUEVO: true si tenemos escudo activo
     fire_timer: f32,
     spawn_timer: f32,
     gate_timer: f32,
     score: i32,
     lives: i32,
     soldiers: i32,
-    bg_scroll: f32,    // cuanto se ha desplazado el fondo
     last_level: i32,   // ultimo nivel visto (para detectar cuando sube)
     banner_timer: f32, // tiempo restante del aviso "NIVEL N"
 }
@@ -217,23 +281,31 @@ impl Game {
             enemies: Vec::new(),
             gates: Vec::new(),
             particles: Vec::new(),
+            powerups: Vec::new(),
+            stars: new_stars(),
+            rapid_timer: 0.0,
+            shield: false,
             fire_timer: 0.0,
             spawn_timer: 0.0,
             gate_timer: 2.0, // la primera fila de puertas sale a los 2 s
             score: 0,
             lives: START_LIVES,
             soldiers: START_SOLDIERS,
-            bg_scroll: 0.0,
             last_level: 1,
             banner_timer: 0.0,
         }
     }
 
-    // Empieza una partida nueva conservando el record.
-    fn start_run(&mut self) {
-        // Primero se calcula Game::new(...) y despues se reemplaza todo el estado.
-        *self = Game::new(self.high_score);
-        self.state = State::Playing;
+    // Reinicia todo y pasa al estado indicado (Playing o Menu).
+    // Conservamos el record y las estrellas para que el fondo no "salte".
+    fn restart(&mut self, new_state: State) {
+        let high_score = self.high_score;
+        // std::mem::take saca las estrellas de self y deja un Vec vacio en su lugar.
+        let stars = std::mem::take(&mut self.stars);
+
+        *self = Game::new(high_score); // partida nueva...
+        self.stars = stars; // ...pero con las mismas estrellas
+        self.state = new_state;
     }
 
     // Se llama cuando las vidas llegan a 0.
@@ -272,21 +344,18 @@ impl Game {
     // ---------- ACTUALIZAR ----------
     // Segun el estado actual, hacemos cosas distintas.
     fn update(&mut self, dt: f32) {
-        // "match" revisa en que estado estamos y ejecuta solo esa rama.
         match self.state {
             State::Menu => {
-                self.update_effects(dt); // el fondo sigue moviendose
-                // ENTER empieza la partida (no usamos ESPACIO porque es el disparo).
+                self.update_effects(dt); // las estrellas siguen moviendose
                 if is_key_pressed(KeyCode::Enter) {
-                    self.start_run();
+                    self.restart(State::Playing);
                 }
             }
 
             State::Playing => {
                 self.update_effects(dt);
 
-                // P o ESC pausan el juego. "return" sale de update:
-                // en ese frame ya no se mueve nada.
+                // P o ESC pausan el juego.
                 if is_key_pressed(KeyCode::P) || is_key_pressed(KeyCode::Escape) {
                     self.state = State::Paused;
                     return;
@@ -295,13 +364,13 @@ impl Game {
                 self.handle_input(dt);
                 self.spawn_things(dt);
                 self.move_things(dt);
+                self.collect_powerups(); // NUEVO
                 self.check_collisions();
                 self.cleanup();
             }
 
             State::Paused => {
-                // En pausa NO llamamos a update_effects ni a nada mas:
-                // todo queda congelado. Solo esperamos para reanudar.
+                // En pausa todo queda congelado. Solo esperamos para reanudar.
                 if is_key_pressed(KeyCode::P) || is_key_pressed(KeyCode::Escape) {
                     self.state = State::Playing;
                 }
@@ -310,19 +379,26 @@ impl Game {
             State::GameOver => {
                 self.update_effects(dt);
                 if is_key_pressed(KeyCode::R) {
-                    self.start_run(); // jugar otra vez
+                    self.restart(State::Playing); // jugar otra vez
                 }
                 if is_key_pressed(KeyCode::M) {
-                    *self = Game::new(self.high_score); // volver al menu
+                    self.restart(State::Menu); // volver al menu
                 }
             }
         }
     }
 
-    // Fondo, particulas y aviso de nivel.
+    // Estrellas, particulas y aviso de nivel.
     fn update_effects(&mut self, dt: f32) {
-        // Fondo: avanza y vuelve a empezar cada GRID_SIZE pixeles.
-        self.bg_scroll = (self.bg_scroll + BG_SPEED * dt) % GRID_SIZE;
+        // Estrellas: bajan a su propia velocidad. Al salir por abajo,
+        // reaparecen arriba en una posicion horizontal nueva.
+        for star in self.stars.iter_mut() {
+            star.y += star.speed * dt;
+            if star.y > screen_height() {
+                star.y = 0.0;
+                star.x = rand::gen_range(0.0, screen_width());
+            }
+        }
 
         // Particulas: se mueven, envejecen y las muertas se borran.
         for p in self.particles.iter_mut() {
@@ -356,6 +432,61 @@ impl Game {
         }
     }
 
+    // NUEVO: con cierta probabilidad, suelta un power-up en (x, y).
+    fn maybe_drop_powerup(&mut self, x: f32, y: f32) {
+        // gen_range(0.0, 1.0) da un decimal entre 0 y 1.
+        // Si sale menor que 0.2, ocurre el 20% de las veces.
+        if rand::gen_range(0.0, 1.0) < POWERUP_DROP_CHANCE {
+            // Elegimos el tipo al azar.
+            let kind = match rand::gen_range(0, 3) {
+                0 => PowerUpKind::RapidFire,
+                1 => PowerUpKind::Shield,
+                _ => PowerUpKind::Heart,
+            };
+            self.powerups.push(PowerUp { x, y, kind });
+        }
+    }
+
+    // NUEVO: aplica el efecto de un power-up recogido.
+    fn apply_powerup(&mut self, kind: PowerUpKind) {
+        match kind {
+            PowerUpKind::RapidFire => self.rapid_timer = RAPID_DURATION,
+            PowerUpKind::Shield => self.shield = true,
+            PowerUpKind::Heart => self.lives = (self.lives + 1).min(MAX_LIVES),
+        }
+    }
+
+    // NUEVO: revisa si la torreta toca algun power-up y lo recoge.
+    fn collect_powerups(&mut self) {
+        // Rectangulo de la torreta, un poco agrandado por el radio del item.
+        let player_rect = Rect::new(
+            self.player_x - PLAYER_WIDTH / 2.0 - POWERUP_RADIUS,
+            player_y() - POWERUP_RADIUS,
+            PLAYER_WIDTH + 2.0 * POWERUP_RADIUS,
+            PLAYER_HEIGHT + 2.0 * POWERUP_RADIUS,
+        );
+
+        // Aqui guardamos los tipos recogidos en este frame.
+        let mut picked: Vec<PowerUpKind> = Vec::new();
+
+        // retain conserva los elementos para los que la funcion devuelve true.
+        // Aprovechamos para: si lo tocamos -> lo anotamos y lo borramos (false);
+        // si no -> lo conservamos mientras no haya salido de la pantalla.
+        self.powerups.retain(|p| {
+            if player_rect.contains(vec2(p.x, p.y)) {
+                picked.push(p.kind);
+                false
+            } else {
+                p.y - POWERUP_RADIUS < screen_height()
+            }
+        });
+
+        // Aplicamos los efectos (fuera del retain para no prestar self dos veces).
+        for kind in picked {
+            self.apply_powerup(kind);
+        }
+    }
+
     // Teclado: mover y disparar.
     fn handle_input(&mut self, dt: f32) {
         if is_key_down(KeyCode::Left) || is_key_down(KeyCode::A) {
@@ -367,6 +498,16 @@ impl Game {
         self.player_x = self
             .player_x
             .clamp(PLAYER_WIDTH / 2.0, screen_width() - PLAYER_WIDTH / 2.0);
+
+        // El disparo rapido se va acabando con el tiempo (sin bajar de 0).
+        self.rapid_timer = (self.rapid_timer - dt).max(0.0);
+
+        // Si el disparo rapido esta activo, el cooldown es mas corto.
+        let cooldown = if self.rapid_timer > 0.0 {
+            FIRE_COOLDOWN * RAPID_FIRE_FACTOR
+        } else {
+            FIRE_COOLDOWN
+        };
 
         // Disparo con cooldown
         self.fire_timer -= dt;
@@ -381,7 +522,7 @@ impl Game {
                     alive: true,
                 });
             }
-            self.fire_timer = FIRE_COOLDOWN;
+            self.fire_timer = cooldown;
         }
     }
 
@@ -413,13 +554,16 @@ impl Game {
         }
     }
 
-    // Mueve balas, enemigos y puertas. Tambien revisa si cruzamos una puerta.
+    // Mueve balas, enemigos, power-ups y puertas. Tambien revisa si cruzamos una puerta.
     fn move_things(&mut self, dt: f32) {
         for bullet in self.bullets.iter_mut() {
             bullet.y -= BULLET_SPEED * dt;
         }
         for enemy in self.enemies.iter_mut() {
             enemy.y += enemy.speed * dt; // cada enemigo usa SU velocidad
+        }
+        for powerup in self.powerups.iter_mut() {
+            powerup.y += POWERUP_SPEED * dt;
         }
 
         for pair in self.gates.iter_mut() {
@@ -468,18 +612,26 @@ impl Game {
             .map(|e| (e.x, e.y))
             .collect();
 
-        // +10 puntos y una explosion por cada enemigo destruido
+        // Por cada enemigo destruido: +10 puntos, explosion y quiza un power-up.
         for (x, y) in &dead_positions {
             self.score += 10;
             self.spawn_explosion(*x, *y);
+            self.maybe_drop_powerup(*x, *y);
         }
 
-        // Enemigos vivos que cruzaron la linea inferior -> pierdes vidas
-        let escaped = self
+        // Enemigos vivos que cruzaron la linea inferior
+        let mut escaped = self
             .enemies
             .iter()
             .filter(|e| e.hp > 0 && e.y - ENEMY_SIZE / 2.0 > screen_height())
             .count() as i32;
+
+        // NUEVO: el escudo absorbe UN enemigo escapado y se consume.
+        if self.shield && escaped > 0 {
+            self.shield = false;
+            escaped -= 1;
+        }
+
         self.lives -= escaped;
 
         if self.lives <= 0 {
@@ -499,7 +651,7 @@ impl Game {
     // ---------- DIBUJAR ----------
     // &self (sin mut): dibujar solo LEE el estado, no lo cambia.
     fn draw(&self) {
-        clear_background(Color::from_rgba(20, 24, 40, 255));
+        clear_background(Color::from_rgba(10, 12, 28, 255));
         self.draw_background();
 
         // En el menu solo dibujamos la pantalla de inicio y terminamos.
@@ -552,6 +704,22 @@ impl Game {
             );
         }
 
+        // Power-ups: circulo de color con borde blanco y su letra al centro.
+        for p in &self.powerups {
+            draw_circle(p.x, p.y, POWERUP_RADIUS, p.kind.color());
+            draw_circle_lines(p.x, p.y, POWERUP_RADIUS, 2.0, WHITE);
+
+            let letter = p.kind.letter();
+            let size = measure_text(letter, None, 22, 1.0);
+            draw_text(
+                letter,
+                p.x - size.width / 2.0,
+                p.y + size.height / 2.0,
+                22.0,
+                BLACK,
+            );
+        }
+
         // Particulas: se hacen mas transparentes y pequenas al envejecer.
         for p in &self.particles {
             let fraction = p.life / PARTICLE_LIFE; // 1.0 = recien nacida, 0.0 = por desaparecer
@@ -575,6 +743,17 @@ impl Game {
             WHITE,
         );
 
+        // NUEVO: anillo alrededor de la torreta si tenemos escudo
+        if self.shield {
+            draw_circle_lines(
+                self.player_x,
+                player_y() + PLAYER_HEIGHT / 2.0,
+                38.0,
+                3.0,
+                SKYBLUE,
+            );
+        }
+
         // Interfaz (HUD)
         draw_text(&format!("Nivel: {}", self.level()), 10.0, 30.0, 26.0, GOLD);
         draw_text(&format!("Puntos: {}", self.score), 10.0, 58.0, 26.0, WHITE);
@@ -586,6 +765,23 @@ impl Game {
             26.0,
             SKYBLUE,
         );
+
+        // NUEVO: efectos activos (cada uno ocupa una linea mas abajo)
+        let mut effect_y = 142.0;
+        if self.rapid_timer > 0.0 {
+            draw_text(
+                &format!("Disparo rapido: {:.0}s", self.rapid_timer.ceil()),
+                10.0,
+                effect_y,
+                22.0,
+                ORANGE,
+            );
+            effect_y += 26.0;
+        }
+        if self.shield {
+            draw_text("Escudo activo", 10.0, effect_y, 22.0, SKYBLUE);
+        }
+
         // El record mostrado sube en vivo si lo estamos superando.
         let shown_record = self.high_score.max(self.score);
         draw_text(
@@ -610,7 +806,6 @@ impl Game {
         // ---- Capas encima del juego segun el estado ----
         match self.state {
             State::Paused => {
-                // Rectangulo negro semitransparente que oscurece la pantalla
                 draw_rectangle(
                     0.0,
                     0.0,
@@ -634,7 +829,6 @@ impl Game {
                     30,
                     WHITE,
                 );
-                // Mensaje de record: uno u otro segun si lo superamos.
                 if self.new_record {
                     draw_centered("NUEVO RECORD!", screen_height() / 2.0 + 35.0, 36, GREEN);
                 } else {
@@ -678,15 +872,22 @@ impl Game {
         draw_centered("Disparar: ESPACIO", screen_height() * 0.52 + 32.0, 26, WHITE);
         draw_centered("Pausa: P o ESC", screen_height() * 0.52 + 64.0, 26, WHITE);
 
+        // Leyenda de los power-ups
+        draw_centered(
+            "Items: R rapido   S escudo   + vida",
+            screen_height() * 0.52 + 104.0,
+            22,
+            LIGHTGRAY,
+        );
+
         draw_centered(
             &format!("Record: {}", self.high_score),
-            screen_height() * 0.52 + 120.0,
+            screen_height() * 0.52 + 150.0,
             30,
             GREEN,
         );
 
         // Texto parpadeante: get_time() son los segundos desde que arranco el juego.
-        // Dividimos en "medios segundos" y mostramos el texto solo en los pares.
         if (get_time() * 2.0) as i32 % 2 == 0 {
             draw_centered(
                 "Presiona ENTER para jugar",
@@ -697,19 +898,18 @@ impl Game {
         }
     }
 
-    // Dibuja el fondo (lineas horizontales que bajan + linea central).
+    // NUEVO: dibuja el fondo de estrellas.
     fn draw_background(&self) {
-        let line_color = Color::from_rgba(255, 255, 255, 18); // blanco muy tenue
+        for star in &self.stars {
+            // t va de 0.0 (estrella mas lenta) a 1.0 (la mas rapida).
+            let t = (star.speed - STAR_MIN_SPEED) / (STAR_MAX_SPEED - STAR_MIN_SPEED);
 
-        let rows = (screen_height() / GRID_SIZE) as i32 + 2;
-        for i in -1..rows {
-            let y = i as f32 * GRID_SIZE + self.bg_scroll;
-            draw_line(0.0, y, screen_width(), y, 1.0, line_color);
+            // Parallax: las rapidas parecen cercanas -> mas grandes y brillantes.
+            let size = 1.0 + 1.5 * t; // radio de 1.0 a 2.5
+            let alpha = 0.25 + 0.65 * t; // transparencia de 0.25 a 0.9
+
+            draw_circle(star.x, star.y, size, Color::new(0.8, 0.9, 1.0, alpha));
         }
-
-        // Linea central: separa visualmente la puerta izquierda de la derecha.
-        let mid = screen_width() / 2.0;
-        draw_line(mid, 0.0, mid, screen_height(), 2.0, line_color);
     }
 }
 
