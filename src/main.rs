@@ -1,18 +1,25 @@
 // ============================================================
-// GATE RUNNER - Paso 8: power-ups y fondo de estrellas
+// GATE RUNNER - Paso 10: musica de fondo en bucle
 // ============================================================
 // Objetivo de este paso:
-//   1. Los enemigos destruidos a veces sueltan un power-up que cae.
-//      Al tocarlo con la torreta se activa:
-//        R = disparo rapido (por unos segundos)
-//        S = escudo (bloquea el siguiente enemigo que se escape)
-//        + = una vida extra
-//   2. Fondo de estrellas con "parallax": las rapidas se ven
-//      grandes y brillantes (cerca), las lentas pequenas (lejos).
+//   1. Generar los efectos de sonido con codigo (sin archivos de audio):
+//      creamos las ondas, las empaquetamos como un archivo WAV en
+//      memoria y las cargamos con macroquad::audio.
+//   2. Que la logica del juego solo "avise" que paso algo (un evento
+//      Sfx) y que main reproduzca el sonido correspondiente.
+//   3. Tecla N para silenciar / activar el sonido.
+//   4. NUEVO: una melodia compuesta con codigo (acordes + arpegio +
+//      bajo + ritmo) que se reproduce en bucle.
+//   5. NUEVO: el volumen de la musica cambia segun el estado
+//      (mas bajo en pausa, apagado en game over).
 // ============================================================
 
 // "prelude" importa todo lo comun de macroquad (colores, teclas, dibujo...)
 use macroquad::prelude::*;
+// Funciones de audio de macroquad
+use macroquad::audio::{
+    load_sound_from_bytes, play_sound, play_sound_once, set_sound_volume, PlaySoundParams, Sound,
+};
 
 // ---------- CONSTANTES ----------
 // Jugador
@@ -69,6 +76,14 @@ const PARTICLES_PER_EXPLOSION: i32 = 12; // particulas al destruir un enemigo
 const PARTICLE_LIFE: f32 = 0.5; // segundos que dura una particula
 const BANNER_TIME: f32 = 2.0; // segundos que se ve el aviso de nivel
 
+// Audio: muestras por segundo con las que generamos los sonidos.
+// 22050 es suficiente para efectos simples y mantiene los archivos pequenos.
+const SAMPLE_RATE: u32 = 22050;
+
+// Musica
+const MUSIC_BPM: f32 = 130.0; // tempo: pulsos (negras) por minuto
+const MUSIC_VOLUME: f32 = 0.5; // volumen maestro de la musica (0.0 a 1.0)
+
 // Archivo donde se guarda el record (en la carpeta desde donde ejecutas el juego)
 const HIGH_SCORE_FILE: &str = "highscore.txt";
 
@@ -85,6 +100,304 @@ fn load_high_score() -> i32 {
 fn save_high_score(score: i32) {
     let _ = std::fs::write(HIGH_SCORE_FILE, score.to_string());
 }
+
+// ============================================================
+// AUDIO
+// ============================================================
+
+// ---------- ENUM: eventos de sonido (Sfx = "sound effects") ----------
+// La logica del juego no reproduce sonidos directamente: solo anota
+// "paso esto". Asi la logica queda separada del audio.
+#[derive(Clone, Copy)]
+enum Sfx {
+    Shoot,       // la torreta dispara
+    Hit,         // una bala golpea a un enemigo
+    Explosion,   // un enemigo es destruido
+    GateGood,    // cruzamos una puerta buena (+ o x)
+    GateBad,     // cruzamos una puerta mala (-)
+    PowerUp,     // recogemos un power-up
+    ShieldBreak, // el escudo absorbe un enemigo
+    LifeLost,    // un enemigo cruza la linea
+    LevelUp,     // subimos de nivel
+    GameOver,    // perdimos
+}
+
+// ---------- ENUM: forma de onda ----------
+// La forma de la onda cambia el "timbre" del sonido.
+#[derive(Clone, Copy)]
+enum Wave {
+    Sine,   // suave y redondo
+    Square, // duro, estilo videojuego retro
+    Noise,  // ruido: ideal para explosiones y golpes
+}
+
+// Genera las muestras de un tono (numeros que describen la onda de sonido).
+//   start_freq -> end_freq : la frecuencia (tono) cambia durante el sonido,
+//                            por ejemplo de agudo a grave.
+//   duration : segundos que dura.
+//   volume   : de 0.0 a 1.0.
+fn synth(wave: Wave, start_freq: f32, end_freq: f32, duration: f32, volume: f32) -> Vec<i16> {
+    // Cuantas muestras necesitamos en total.
+    let total = (SAMPLE_RATE as f32 * duration) as usize;
+    let mut samples = Vec::with_capacity(total);
+
+    // "phase" es el punto actual dentro de la onda (en radianes).
+    let mut phase: f32 = 0.0;
+
+    for i in 0..total {
+        // t avanza de 0.0 (inicio del sonido) a 1.0 (final).
+        let t = i as f32 / total as f32;
+
+        // Frecuencia actual: va de start_freq a end_freq en linea recta.
+        let freq = start_freq + (end_freq - start_freq) * t;
+
+        // Avanzamos la fase segun la frecuencia.
+        phase += std::f32::consts::TAU * freq / SAMPLE_RATE as f32;
+
+        // Valor de la onda en este instante, entre -1.0 y 1.0.
+        let raw = match wave {
+            Wave::Sine => phase.sin(),
+            Wave::Square => {
+                if phase.sin() >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            Wave::Noise => rand::gen_range(-1.0, 1.0),
+        };
+
+        // Envolvente: el sonido empieza fuerte y se apaga hacia el final.
+        // Sin esto sonaria un "clic" molesto al cortarse de golpe.
+        let envelope = (1.0 - t).powi(2);
+
+        // Convertimos a entero de 16 bits (el formato WAV), que va de -32767 a 32767.
+        samples.push((raw * envelope * volume * i16::MAX as f32) as i16);
+    }
+
+    samples
+}
+
+// Empaqueta las muestras en un archivo WAV (en memoria, no en disco).
+// Un WAV es una cabecera de 44 bytes + las muestras.
+// Formato: PCM, 1 canal (mono), 16 bits.
+fn build_wav(samples: &[i16]) -> Vec<u8> {
+    let data_len = (samples.len() * 2) as u32; // cada muestra ocupa 2 bytes
+    let mut bytes: Vec<u8> = Vec::with_capacity(44 + data_len as usize);
+
+    // to_le_bytes() convierte un numero a bytes en orden "little endian",
+    // que es el que exige el formato WAV.
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data_len).to_le_bytes()); // tamano del archivo - 8
+    bytes.extend_from_slice(b"WAVE");
+
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes()); // tamano de este bloque
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // 1 = PCM (sin comprimir)
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // 1 canal (mono)
+    bytes.extend_from_slice(&SAMPLE_RATE.to_le_bytes()); // muestras por segundo
+    bytes.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // bytes por segundo
+    bytes.extend_from_slice(&2u16.to_le_bytes()); // bytes por muestra
+    bytes.extend_from_slice(&16u16.to_le_bytes()); // bits por muestra
+
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_len.to_le_bytes());
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+
+    bytes
+}
+
+// Crea un sonido listo para reproducir: sintetiza, empaqueta como WAV y carga.
+async fn make_sound(wave: Wave, start_freq: f32, end_freq: f32, duration: f32, volume: f32) -> Sound {
+    let samples = synth(wave, start_freq, end_freq, duration, volume);
+    let wav = build_wav(&samples);
+    load_sound_from_bytes(&wav)
+        .await
+        .expect("No se pudo crear el sonido")
+}
+
+// ---------- MUSICA ----------
+// Convierte una nota MIDI en frecuencia (Hz).
+// En MIDI cada numero es un semitono: 69 = La4 = 440 Hz, 60 = Do4 (do central).
+// Subir 12 numeros = subir una octava = duplicar la frecuencia.
+fn midi_to_freq(note: i32) -> f32 {
+    440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0)
+}
+
+// Genera una nota y la SUMA en un buffer de mezcla, empezando en la muestra "start".
+// Sumar las ondas es como se mezclan varios instrumentos a la vez.
+fn add_note(buffer: &mut [f32], start: usize, wave: Wave, freq: f32, duration: f32, volume: f32) {
+    // Reutilizamos synth() de los efectos: una nota es un tono sin cambio de frecuencia.
+    let samples = synth(wave, freq, freq, duration, volume);
+
+    for (i, sample) in samples.iter().enumerate() {
+        // get_mut devuelve None si el indice se sale del buffer
+        // (asi una nota larga no rompe el final de la melodia).
+        if let Some(slot) = buffer.get_mut(start + i) {
+            *slot += *sample as f32;
+        }
+    }
+}
+
+// Compone la melodia completa: 4 compases que luego se repiten en bucle.
+fn make_music() -> Vec<i16> {
+    // Duracion de una corchea (1/8 de compas) en segundos.
+    // Un pulso dura 60/BPM segundos y una corchea es medio pulso.
+    let step_secs = 60.0 / MUSIC_BPM / 2.0;
+
+    // 4 compases x 8 corcheas = 32 pasos.
+    let total_steps = 32;
+    let total_samples = (total_steps as f32 * step_secs * SAMPLE_RATE as f32) as usize;
+
+    // Buffer de mezcla en decimales (f32) para poder sumar sin desbordar.
+    // vec![0.0; n] crea una lista con n ceros (silencio).
+    let mut buffer = vec![0.0_f32; total_samples];
+
+    // Progresion de acordes en La menor: Am - F - C - G (muy usada en el pop y el rock).
+    // Cada acorde son 3 notas MIDI: [fundamental, tercera, quinta].
+    let chords: [[i32; 3]; 4] = [
+        [57, 60, 64], // Am: La3, Do4, Mi4
+        [53, 57, 60], // F:  Fa3, La3, Do4
+        [60, 64, 67], // C:  Do4, Mi4, Sol4
+        [55, 59, 62], // G:  Sol3, Si3, Re4
+    ];
+
+    // Patron del arpegio: que nota del acorde (0, 1 o 2) suena en cada corchea.
+    let arp = [0usize, 1, 2, 1, 0, 1, 2, 1];
+
+    for bar in 0..4 {
+        let chord = chords[bar];
+
+        for step in 0..8 {
+            // Numero de paso en toda la cancion y muestra donde empieza.
+            let global_step = bar * 8 + step;
+            let start = (global_step as f32 * step_secs * SAMPLE_RATE as f32) as usize;
+
+            // MELODIA: nota del acorde, una octava arriba (+12), onda suave.
+            let lead = chord[arp[step]] + 12;
+            add_note(&mut buffer, start, Wave::Sine, midi_to_freq(lead), step_secs * 1.5, 0.20);
+
+            // BAJO: la fundamental dos octavas abajo, en los pasos 0 y 4 (tiempos 1 y 3).
+            if step % 4 == 0 {
+                add_note(
+                    &mut buffer,
+                    start,
+                    Wave::Square,
+                    midi_to_freq(chord[0] - 12),
+                    step_secs * 3.5,
+                    0.10,
+                );
+            }
+
+            // RITMO: un "hi-hat" (ruido muy corto) en las corcheas impares.
+            if step % 2 == 1 {
+                add_note(&mut buffer, start, Wave::Noise, 0.0, 0.03, 0.05);
+            }
+        }
+    }
+
+    // Pasamos del buffer decimal a enteros de 16 bits, limitando los extremos.
+    buffer
+        .iter()
+        .map(|s| s.clamp(-32767.0, 32767.0) as i16)
+        .collect()
+}
+
+// Crea el sonido de la musica listo para reproducir.
+async fn make_music_sound() -> Sound {
+    let wav = build_wav(&make_music());
+    load_sound_from_bytes(&wav)
+        .await
+        .expect("No se pudo crear la musica")
+}
+
+// Volumen de la musica segun el estado del juego.
+fn volume_for_state(state: State) -> f32 {
+    let factor = match state {
+        State::Menu => 0.6,     // un poco mas suave en el menu
+        State::Playing => 1.0,  // volumen completo jugando
+        State::Paused => 0.25,  // bajita en pausa
+        State::GameOver => 0.0, // silencio al perder
+    };
+    factor * MUSIC_VOLUME
+}
+
+// ---------- STRUCT SOUNDS: todos los sonidos del juego ----------
+struct Sounds {
+    shoot: Sound,
+    hit: Sound,
+    explosion: Sound,
+    gate_good: Sound,
+    gate_bad: Sound,
+    power_up: Sound,
+    shield_break: Sound,
+    life_lost: Sound,
+    level_up: Sound,
+    game_over: Sound,
+    music: Sound, // la melodia de fondo
+}
+
+impl Sounds {
+    // Crea todos los sonidos al arrancar el juego.
+    // Cada linea: forma de onda, tono inicial, tono final, duracion, volumen.
+    async fn load() -> Sounds {
+        Sounds {
+            shoot: make_sound(Wave::Square, 880.0, 220.0, 0.10, 0.15).await, // "pew": agudo a grave
+            hit: make_sound(Wave::Noise, 0.0, 0.0, 0.04, 0.25).await,        // golpe seco
+            explosion: make_sound(Wave::Noise, 0.0, 0.0, 0.30, 0.45).await,  // ruido que se apaga
+            gate_good: make_sound(Wave::Sine, 400.0, 900.0, 0.20, 0.40).await, // sube = bueno
+            gate_bad: make_sound(Wave::Sine, 350.0, 100.0, 0.25, 0.40).await,  // baja = malo
+            power_up: make_sound(Wave::Square, 500.0, 1200.0, 0.25, 0.18).await,
+            shield_break: make_sound(Wave::Sine, 900.0, 200.0, 0.20, 0.40).await,
+            life_lost: make_sound(Wave::Square, 220.0, 80.0, 0.30, 0.25).await,
+            level_up: make_sound(Wave::Sine, 440.0, 1000.0, 0.40, 0.45).await,
+            game_over: make_sound(Wave::Square, 400.0, 50.0, 0.90, 0.25).await,
+            music: make_music_sound().await,
+        }
+    }
+
+    // Reproduce el sonido que corresponde a un evento.
+    fn play(&self, sfx: Sfx) {
+        // match devuelve una referencia al sonido adecuado...
+        let sound = match sfx {
+            Sfx::Shoot => &self.shoot,
+            Sfx::Hit => &self.hit,
+            Sfx::Explosion => &self.explosion,
+            Sfx::GateGood => &self.gate_good,
+            Sfx::GateBad => &self.gate_bad,
+            Sfx::PowerUp => &self.power_up,
+            Sfx::ShieldBreak => &self.shield_break,
+            Sfx::LifeLost => &self.life_lost,
+            Sfx::LevelUp => &self.level_up,
+            Sfx::GameOver => &self.game_over,
+        };
+        // ...y lo reproducimos una vez.
+        play_sound_once(sound);
+    }
+
+    // Empieza la musica en bucle (looped: true = al terminar, vuelve a empezar).
+    // La arrancamos en silencio; despues el loop principal ajusta el volumen.
+    fn start_music(&self) {
+        play_sound(
+            &self.music,
+            PlaySoundParams {
+                looped: true,
+                volume: 0.0,
+            },
+        );
+    }
+
+    // Cambia el volumen de la musica mientras sigue sonando.
+    fn set_music_volume(&self, volume: f32) {
+        set_sound_volume(&self.music, volume);
+    }
+}
+
+// ============================================================
+// JUEGO
+// ============================================================
 
 // ---------- ENUM: estado del juego ----------
 #[derive(Clone, Copy, PartialEq)]
@@ -255,10 +568,11 @@ struct Game {
     enemies: Vec<Enemy>,
     gates: Vec<GatePair>,
     particles: Vec<Particle>,
-    powerups: Vec<PowerUp>, // NUEVO: power-ups cayendo
-    stars: Vec<Star>,       // NUEVO: estrellas del fondo
-    rapid_timer: f32,       // NUEVO: segundos restantes de disparo rapido
-    shield: bool,           // NUEVO: true si tenemos escudo activo
+    powerups: Vec<PowerUp>, // power-ups cayendo
+    stars: Vec<Star>,       // estrellas del fondo
+    sfx: Vec<Sfx>,          // NUEVO: eventos de sonido pendientes de reproducir
+    rapid_timer: f32,       // segundos restantes de disparo rapido
+    shield: bool,           // true si tenemos escudo activo
     fire_timer: f32,
     spawn_timer: f32,
     gate_timer: f32,
@@ -283,6 +597,7 @@ impl Game {
             particles: Vec::new(),
             powerups: Vec::new(),
             stars: new_stars(),
+            sfx: Vec::new(),
             rapid_timer: 0.0,
             shield: false,
             fire_timer: 0.0,
@@ -296,11 +611,16 @@ impl Game {
         }
     }
 
+    // NUEVO: entrega los eventos de sonido pendientes y deja la lista vacia.
+    // main los usa para reproducirlos.
+    fn take_sfx(&mut self) -> Vec<Sfx> {
+        std::mem::take(&mut self.sfx)
+    }
+
     // Reinicia todo y pasa al estado indicado (Playing o Menu).
     // Conservamos el record y las estrellas para que el fondo no "salte".
     fn restart(&mut self, new_state: State) {
         let high_score = self.high_score;
-        // std::mem::take saca las estrellas de self y deja un Vec vacio en su lugar.
         let stars = std::mem::take(&mut self.stars);
 
         *self = Game::new(high_score); // partida nueva...
@@ -311,6 +631,7 @@ impl Game {
     // Se llama cuando las vidas llegan a 0.
     fn end_game(&mut self) {
         self.state = State::GameOver;
+        self.sfx.push(Sfx::GameOver);
 
         // ¿Superamos el record? Lo actualizamos y lo guardamos en el archivo.
         if self.score > self.high_score {
@@ -364,7 +685,7 @@ impl Game {
                 self.handle_input(dt);
                 self.spawn_things(dt);
                 self.move_things(dt);
-                self.collect_powerups(); // NUEVO
+                self.collect_powerups();
                 self.check_collisions();
                 self.cleanup();
             }
@@ -408,10 +729,11 @@ impl Game {
         }
         self.particles.retain(|p| p.life > 0.0);
 
-        // Aviso de nivel: si el nivel cambio, activamos el aviso.
+        // Aviso de nivel: si el nivel cambio, activamos el aviso y el sonido.
         if self.level() != self.last_level {
             self.last_level = self.level();
             self.banner_timer = BANNER_TIME;
+            self.sfx.push(Sfx::LevelUp);
         }
         self.banner_timer = (self.banner_timer - dt).max(0.0);
     }
@@ -432,12 +754,9 @@ impl Game {
         }
     }
 
-    // NUEVO: con cierta probabilidad, suelta un power-up en (x, y).
+    // Con cierta probabilidad, suelta un power-up en (x, y).
     fn maybe_drop_powerup(&mut self, x: f32, y: f32) {
-        // gen_range(0.0, 1.0) da un decimal entre 0 y 1.
-        // Si sale menor que 0.2, ocurre el 20% de las veces.
         if rand::gen_range(0.0, 1.0) < POWERUP_DROP_CHANCE {
-            // Elegimos el tipo al azar.
             let kind = match rand::gen_range(0, 3) {
                 0 => PowerUpKind::RapidFire,
                 1 => PowerUpKind::Shield,
@@ -447,7 +766,7 @@ impl Game {
         }
     }
 
-    // NUEVO: aplica el efecto de un power-up recogido.
+    // Aplica el efecto de un power-up recogido.
     fn apply_powerup(&mut self, kind: PowerUpKind) {
         match kind {
             PowerUpKind::RapidFire => self.rapid_timer = RAPID_DURATION,
@@ -456,7 +775,7 @@ impl Game {
         }
     }
 
-    // NUEVO: revisa si la torreta toca algun power-up y lo recoge.
+    // Revisa si la torreta toca algun power-up y lo recoge.
     fn collect_powerups(&mut self) {
         // Rectangulo de la torreta, un poco agrandado por el radio del item.
         let player_rect = Rect::new(
@@ -470,8 +789,6 @@ impl Game {
         let mut picked: Vec<PowerUpKind> = Vec::new();
 
         // retain conserva los elementos para los que la funcion devuelve true.
-        // Aprovechamos para: si lo tocamos -> lo anotamos y lo borramos (false);
-        // si no -> lo conservamos mientras no haya salido de la pantalla.
         self.powerups.retain(|p| {
             if player_rect.contains(vec2(p.x, p.y)) {
                 picked.push(p.kind);
@@ -484,6 +801,7 @@ impl Game {
         // Aplicamos los efectos (fuera del retain para no prestar self dos veces).
         for kind in picked {
             self.apply_powerup(kind);
+            self.sfx.push(Sfx::PowerUp);
         }
     }
 
@@ -523,6 +841,8 @@ impl Game {
                 });
             }
             self.fire_timer = cooldown;
+            // Un solo sonido por disparo, sin importar cuantas balas salgan.
+            self.sfx.push(Sfx::Shoot);
         }
     }
 
@@ -582,12 +902,23 @@ impl Game {
                 };
                 self.soldiers = op.apply(self.soldiers).clamp(1, MAX_SOLDIERS);
                 pair.used = true;
+
+                // Sonido segun el tipo de puerta. matches! devuelve true si
+                // "op" es de la variante indicada (el _ ignora el numero).
+                if matches!(op, GateOp::Subtract(_)) {
+                    self.sfx.push(Sfx::GateBad);
+                } else {
+                    self.sfx.push(Sfx::GateGood);
+                }
             }
         }
     }
 
     // Balas vs enemigos, puntos, vidas y game over.
     fn check_collisions(&mut self) {
+        // Para tocar UN solo sonido de golpe por frame (aunque haya muchas balas).
+        let mut any_hit = false;
+
         for bullet in self.bullets.iter_mut() {
             for enemy in self.enemies.iter_mut() {
                 let enemy_rect = Rect::new(
@@ -599,9 +930,14 @@ impl Game {
                 if bullet.alive && enemy_rect.contains(vec2(bullet.x, bullet.y)) {
                     enemy.hp -= 1;
                     bullet.alive = false;
+                    any_hit = true;
                     break;
                 }
             }
+        }
+
+        if any_hit {
+            self.sfx.push(Sfx::Hit);
         }
 
         // Posiciones de los enemigos destruidos (primero juntamos, luego usamos).
@@ -618,6 +954,9 @@ impl Game {
             self.spawn_explosion(*x, *y);
             self.maybe_drop_powerup(*x, *y);
         }
+        if !dead_positions.is_empty() {
+            self.sfx.push(Sfx::Explosion); // un solo sonido aunque mueran varios
+        }
 
         // Enemigos vivos que cruzaron la linea inferior
         let mut escaped = self
@@ -626,17 +965,20 @@ impl Game {
             .filter(|e| e.hp > 0 && e.y - ENEMY_SIZE / 2.0 > screen_height())
             .count() as i32;
 
-        // NUEVO: el escudo absorbe UN enemigo escapado y se consume.
+        // El escudo absorbe UN enemigo escapado y se consume.
         if self.shield && escaped > 0 {
             self.shield = false;
             escaped -= 1;
+            self.sfx.push(Sfx::ShieldBreak);
         }
 
         self.lives -= escaped;
 
         if self.lives <= 0 {
             self.lives = 0;
-            self.end_game(); // cambia el estado a GameOver y revisa el record
+            self.end_game(); // cambia el estado a GameOver (y suena GameOver)
+        } else if escaped > 0 {
+            self.sfx.push(Sfx::LifeLost);
         }
     }
 
@@ -743,7 +1085,7 @@ impl Game {
             WHITE,
         );
 
-        // NUEVO: anillo alrededor de la torreta si tenemos escudo
+        // Anillo alrededor de la torreta si tenemos escudo
         if self.shield {
             draw_circle_lines(
                 self.player_x,
@@ -766,7 +1108,7 @@ impl Game {
             SKYBLUE,
         );
 
-        // NUEVO: efectos activos (cada uno ocupa una linea mas abajo)
+        // Efectos activos (cada uno ocupa una linea mas abajo)
         let mut effect_y = 142.0;
         if self.rapid_timer > 0.0 {
             draw_text(
@@ -898,7 +1240,7 @@ impl Game {
         }
     }
 
-    // NUEVO: dibuja el fondo de estrellas.
+    // Dibuja el fondo de estrellas.
     fn draw_background(&self) {
         for star in &self.stars {
             // t va de 0.0 (estrella mas lenta) a 1.0 (la mas rapida).
@@ -924,19 +1266,59 @@ fn window_conf() -> Conf {
     }
 }
 
-// main sigue siendo muy corto: crea la partida y repite actualizar + dibujar.
+// main: crea los sonidos y la partida, y repite actualizar + sonar + dibujar.
 #[macroquad::main(window_conf)]
 async fn main() {
     // Semilla del generador de numeros aleatorios (la hora actual).
     rand::srand(macroquad::miniquad::date::now() as u64);
 
+    // Creamos todos los sonidos una sola vez, al arrancar.
+    let sounds = Sounds::load().await;
+
     // Cargamos el record guardado y arrancamos en el menu.
     let mut game = Game::new(load_high_score());
 
+    // true = sonido silenciado (tecla N)
+    let mut muted = false;
+
+    // Arrancamos la musica en bucle (empieza en silencio).
+    sounds.start_music();
+    // Ultimo volumen aplicado. Empieza en -1.0 para forzar el primer ajuste.
+    let mut last_music_volume: f32 = -1.0;
+
     loop {
         let dt = get_frame_time();
+
+        if is_key_pressed(KeyCode::N) {
+            muted = !muted; // alterna entre true y false
+        }
+
         game.update(dt); // logica
+
+        // Reproducimos los sonidos que la logica pidio en este frame.
+        // take_sfx() siempre vacia la lista, incluso en silencio,
+        // para que no se acumulen eventos.
+        let events = game.take_sfx();
+        if !muted {
+            for sfx in events {
+                sounds.play(sfx);
+            }
+        }
+
+        // Volumen de la musica segun el estado (0 si esta silenciado).
+        // Solo lo cambiamos cuando es distinto al anterior.
+        let target_volume = if muted { 0.0 } else { volume_for_state(game.state) };
+        if target_volume != last_music_volume {
+            sounds.set_music_volume(target_volume);
+            last_music_volume = target_volume;
+        }
+
         game.draw(); // dibujo
+
+        // Indicador de sonido, abajo a la derecha, encima de todo lo demas.
+        let label = if muted { "N: sonido OFF" } else { "N: sonido ON" };
+        draw_text(label, screen_width() - 130.0, screen_height() - 10.0, 18.0, GRAY);
+
         next_frame().await;
     }
 }
