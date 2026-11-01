@@ -1,0 +1,9 @@
+# Configuracion de Cargo para este proyecto.
+#
+# Al compilar para la web (wasm32-unknown-unknown), el audio de macroquad
+# (quad-snd) usa funciones que no existen en el .wasm: las provee el
+# archivo mq_js_bundle.js del navegador. Con "--import-undefined" le
+# decimos al linker que las deje como "imports" en lugar de dar error.
+# Los builds nativos (Windows/Linux/macOS) no se ven afectados.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--import-undefined"]

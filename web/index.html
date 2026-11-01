@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <title>Gate Runner</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <meta name="description" content="Gate Runner: shoot 'em up educativo hecho en Rust + macroquad.">
+    <meta name="theme-color" content="#0a0a14">
+    <!-- Manifiesto de la PWA: nombre, iconos y modo de pantalla al instalar -->
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" type="image/png" href="icon-192.png">
+    <link rel="apple-touch-icon" href="icon-192.png">
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background: #0a0a14;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        /* El juego esta disenado para 480x800 (como la ventana nativa).
+           Mantenemos ese tamano interno y lo escalamos con transform
+           para que quepa en cualquier pantalla sin deformarse. */
+        canvas {
+            width: 480px;
+            height: 800px;
+            display: block;
+            outline: none;
+            z-index: 0;
+            transform-origin: center center;
+        }
+        /* Boton "Instalar": oculto hasta que el navegador avise
+           que la app se puede instalar (evento beforeinstallprompt). */
+        #install-btn {
+            display: none;
+            position: fixed;
+            top: 12px;
+            right: 12px;
+            z-index: 10;
+            padding: 10px 16px;
+            font: bold 15px system-ui, sans-serif;
+            color: #0a0a14;
+            background: #35d0ff;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+        }
+        #install-btn:hover { background: #7de2ff; }
+    </style>
+</head>
+<body>
+    <canvas id="glcanvas" tabindex="1"></canvas>
+    <button id="install-btn" type="button">⬇ Instalar</button>
+
+    <!-- Runtime de macroquad para el navegador (vendorizado para funcionar offline) -->
+    <script src="mq_js_bundle.js"></script>
+    <script>
+        // Escala el canvas (480x800) para que quepa en la ventana
+        // manteniendo la proporcion, como un juego de celular.
+        const gameCanvas = document.getElementById("glcanvas");
+        function fitCanvas() {
+            const scale = Math.min(window.innerWidth / 480, window.innerHeight / 800);
+            gameCanvas.style.transform = `scale(${scale})`;
+        }
+        window.addEventListener("resize", fitCanvas);
+        fitCanvas();
+
+        // Carga y arranca el juego compilado a WebAssembly.
+        load("gaterunner.wasm");
+
+        // --- Service worker: permite jugar sin conexion ---
+        // Se registra solo si el navegador lo soporta (y la pagina se sirve
+        // por https o localhost). El service worker cachea todos los archivos
+        // del juego; en visitas posteriores funciona aunque no haya internet.
+        if ("serviceWorker" in navigator) {
+            window.addEventListener("load", () => {
+                navigator.serviceWorker.register("sw.js").catch((err) => {
+                    console.warn("No se pudo registrar el service worker:", err);
+                });
+            });
+        }
+
+        // --- Boton de instalacion de la PWA ---
+        // El navegador dispara "beforeinstallprompt" cuando la app cumple los
+        // requisitos de instalacion. Guardamos el evento y mostramos el boton;
+        // al hacer clic, lanzamos el dialogo nativo de instalacion.
+        let deferredInstallPrompt = null;
+        const installBtn = document.getElementById("install-btn");
+
+        window.addEventListener("beforeinstallprompt", (event) => {
+            event.preventDefault(); // evita el mini-aviso automatico del navegador
+            deferredInstallPrompt = event;
+            // No mostramos el boton si ya se esta ejecutando como app instalada.
+            if (!window.matchMedia("(display-mode: standalone)").matches) {
+                installBtn.style.display = "block";
+            }
+        });
+
+        installBtn.addEventListener("click", async () => {
+            if (!deferredInstallPrompt) return;
+            deferredInstallPrompt.prompt();
+            const { outcome } = await deferredInstallPrompt.userChoice;
+            if (outcome === "accepted") {
+                installBtn.style.display = "none";
+            }
+            deferredInstallPrompt = null;
+        });
+
+        // Cuando la app ya quedo instalada, ocultamos el boton.
+        window.addEventListener("appinstalled", () => {
+            installBtn.style.display = "none";
+            deferredInstallPrompt = null;
+        });
+    </script>
+</body>
+</html>

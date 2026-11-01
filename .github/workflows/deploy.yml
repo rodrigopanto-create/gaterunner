@@ -1,0 +1,74 @@
+# ============================================================
+# Despliegue a GitHub Pages
+# ============================================================
+# Cada push a main:
+#   1. Compila el juego a WebAssembly (wasm32-unknown-unknown).
+#   2. Junta el .wasm con los archivos de web/ (HTML, PWA, iconos).
+#   3. Publica la carpeta resultante en GitHub Pages.
+#
+# Requisito (una sola vez): en el repo, Settings -> Pages ->
+# Source = "GitHub Actions".
+
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # permite lanzarlo a mano desde la pestana Actions
+
+# Permisos minimos que necesita el deploy oficial de Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Si hay varios pushes seguidos, solo se despliega el ultimo.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Rust con el target de WebAssembly
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cachear dependencias de Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compilar a WebAssembly
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Armar la carpeta del sitio
+        run: |
+          mkdir dist
+          cp web/* dist/
+          cp target/wasm32-unknown-unknown/release/gaterunner.wasm dist/
+          # Versionamos el cache del service worker con el hash del commit
+          # para que los jugadores reciban la version nueva automaticamente.
+          sed -i "s/__CACHE_VERSION__/${GITHUB_SHA::8}/" dist/sw.js
+
+      - name: Configurar Pages
+        uses: actions/configure-pages@v5
+
+      - name: Subir el sitio como artefacto
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Desplegar a GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

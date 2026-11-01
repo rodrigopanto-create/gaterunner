@@ -4,6 +4,19 @@ Un juego 2D hecho en **Rust** con **[macroquad](https://macroquad.rs/)**, pensad
 
 Combina la mecánica de las puertas de multiplicación (`x2`, `+5`, `-10`) con un *shoot 'em up* y un toque de *tower defense*: dispara a las oleadas de enemigos que bajan y evita que crucen tu línea.
 
+## 🎮 Jugar en el navegador
+
+El juego está publicado en GitHub Pages:
+
+**➡ https://rodrigopanto-create.github.io/gaterunner/**
+
+Además es una **PWA** (*Progressive Web App*):
+
+- **Instalar:** al abrir la página aparece un botón **⬇ Instalar** (arriba a la derecha). Al pulsarlo, el juego se instala como una app con su propio ícono y ventana.
+- **Jugar sin conexión:** un *service worker* guarda todos los archivos del juego en el navegador; después de la primera visita puedes jugar aunque no tengas internet.
+
+> Nota: en la versión web el récord no se guarda entre sesiones (la versión de escritorio lo guarda en `highscore.txt`).
+
 ## Cómo se juega
 
 - Tu torreta avanza sola; tú la mueves a izquierda y derecha.
@@ -42,11 +55,40 @@ Tu mejor puntaje se guarda en `highscore.txt`.
 
 ## Ejecutar
 
+### Escritorio (nativo)
+
 ```bash
-git clone https://github.com/<tu-usuario>/gaterunner.git
+git clone https://github.com/rodrigopanto-create/gaterunner.git
 cd gaterunner
 cargo run --release
 ```
+
+### Web (WebAssembly)
+
+El juego se compila a WebAssembly con el target `wasm32-unknown-unknown`:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown
+```
+
+Para probarlo en local, junta el `.wasm` con los archivos de `web/` y sírvelos con cualquier servidor estático (el service worker requiere `http://localhost` o `https`):
+
+```bash
+mkdir dist
+cp web/* dist/
+cp target/wasm32-unknown-unknown/release/gaterunner.wasm dist/
+# por ejemplo, con Python:
+python -m http.server 8080 -d dist
+```
+
+> El archivo [.cargo/config.toml](.cargo/config.toml) añade el flag de linker `--import-undefined` que necesita el audio de macroquad en la web. No afecta a los builds nativos.
+
+### Despliegue automático (GitHub Actions)
+
+Cada *push* a `main` ejecuta el workflow [.github/workflows/deploy.yml](.github/workflows/deploy.yml), que compila el juego a WASM y publica la carpeta resultante en GitHub Pages.
+
+Configuración necesaria (una sola vez): en el repositorio, **Settings → Pages → Source = "GitHub Actions"**.
 
 ## Estructura del proyecto
 
@@ -62,6 +104,16 @@ src/
 ├── synth.rs         Sintetizador de ondas y creación del WAV
 ├── audio.rs         Efectos de sonido (Sfx) y reproductor (Sounds)
 └── music.rs         Melodía de fondo
+web/
+├── index.html       Página del juego + botón de instalación de la PWA
+├── manifest.webmanifest  Nombre, colores e íconos de la PWA
+├── sw.js            Service worker: cache para jugar sin conexión
+├── mq_js_bundle.js  Runtime de macroquad para el navegador (vendorizado)
+└── icon-*.png       Íconos de la app
+.cargo/
+└── config.toml      Flag de linker para el build de WebAssembly
+.github/workflows/
+└── deploy.yml       CI: compila a WASM y despliega a GitHub Pages
 ```
 
 ## Todo se genera con código
@@ -88,6 +140,7 @@ El proyecto se construyó paso a paso. Cada paso introduce conceptos de Rust y d
 | 9 | Efectos de sonido | Síntesis de audio, formato WAV, eventos |
 | 10 | Música de fondo en bucle | Notas MIDI, mezcla de ondas, volumen por estado |
 | 11 | Código dividido en módulos | `mod`, `use`, `pub`, módulos hijos |
+| 12 | Versión web instalable | WebAssembly, PWA, service worker, GitHub Actions |
 
 ## Ideas para seguir
 
@@ -96,6 +149,7 @@ El proyecto se construyó paso a paso. Cada paso introduce conceptos de Rust y d
 - Música que cambie con el nivel
 - Pantalla de tabla de récords
 - Controles táctiles o de gamepad
+- Guardar el récord en la web con `localStorage`
 
 ## Ajustar el juego
 
